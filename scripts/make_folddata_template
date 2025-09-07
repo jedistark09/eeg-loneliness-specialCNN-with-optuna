@@ -1,0 +1,54 @@
+"""
+make_folddata_template.py
+
+Template script to generate a FoldData.pkl file for EEG subject-independent K-Fold experiments.
+⚠️ This is only a placeholder! Replace the example file paths and labels with your own dataset.
+
+Output:
+    ./data/FoldData.pkl
+"""
+
+import pickle
+import os
+
+# ---------------- Template Example ---------------- #
+# Each fold is a dict with:
+#   - TrainFiles: list of .mat file paths for training
+#   - TrainLabels: list of labels ("loneliness" or "not_loneliness")
+#   - ValidationFiles: list of .mat file paths for validation
+#   - ValidationLabels: list of labels
+
+FoldData = [
+    {
+        "TrainFiles": [
+            "/absolute/path/to/subj01/segment_01.mat",
+            "/absolute/path/to/subj01/segment_02.mat",
+        ],
+        "TrainLabels": ["loneliness", "not_loneliness"],
+        "ValidationFiles": [
+            "/absolute/path/to/subj09/segment_01.mat",
+        ],
+        "ValidationLabels": ["loneliness"],
+    },
+    {
+        "TrainFiles": [
+            "/absolute/path/to/subj02/segment_01.mat",
+            "/absolute/path/to/subj02/segment_02.mat",
+        ],
+        "TrainLabels": ["not_loneliness", "loneliness"],
+        "ValidationFiles": [
+            "/absolute/path/to/subj10/segment_01.mat",
+        ],
+        "ValidationLabels": ["not_loneliness"],
+    }
+]
+
+# Ensure ./data exists
+os.makedirs("data", exist_ok=True)
+
+# Save pickle file
+with open("data/FoldData.pkl", "wb") as f:
+    pickle.dump(FoldData, f)
+
+print("✅ Template FoldData.pkl saved to ./data/FoldData.pkl")
+print("⚠️ Reminder: Update file paths and labels before running training!")

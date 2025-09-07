@@ -1,0 +1,326 @@
+"""
+train_optuna_eeg.py
+
+Universal Optuna-tuned CNN (SELU-based) for subject-independent EEG classification.
+
+Assumptions
+-----------
+- FoldData.pkl is a Python list (length = #folds). Each item is a dict with keys:
+    'TrainFiles', 'TrainLabels', 'ValidationFiles', 'ValidationLabels'
+  where *Files are lists of absolute/relative paths to .mat files and
+  *Labels are lists with values in {'loneliness', 'not_loneliness'} (case-insensitive).
+- Each .mat file contains a 2D numpy array shaped [25, T] (25 EEG channels by time).
+
+Notes
+-----
+- Uses SELU + AlphaDropout; weights are initialized with LeCun normal (fan_in) as recommended.
+- GPU is used if available; otherwise falls back to CPU automatically.
+- All prints/logs are English; no personal paths or machine-specific settings are embedded.
+
+Usage
+-----
+python train_optuna_eeg.py --folddata ./FoldData.pkl --trials 50
+"""
+
+import argparse
+import logging
+import os
+import pickle
+from typing import List, Dict, Any
+
+import numpy as np
+import optuna
+from optuna.samplers import TPESampler
+import scipy.io
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
+from torch.utils.data import TensorDataset, DataLoader
+
+
+# -------------------------- Logging & Reproducibility -------------------------- #
+def set_seeds(seed: int = 42) -> None:
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # For speed while keeping acceptable determinism:
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+
+# ------------------------------- Data Utilities -------------------------------- #
+def load_mat_files_as_tensor(file_paths: List[str]) -> torch.Tensor:
+    """
+    Load a list of .mat files into a 4D tensor shaped [N, 1, 25, T],
+    where N = number of files, 25 channels, and T = time dimension.
+
+    Strategy to find the EEG array inside .mat:
+    - look for the first ndarray with shape[0] == 25
+    - cast to float32
+    """
+    data = []
+    for path in file_paths:
+        mat = scipy.io.loadmat(path)
+        arr = None
+        for val in mat.values():
+            if isinstance(val, np.ndarray) and val.ndim == 2 and val.shape[0] == 25:
+                arr = val
+                break
+        if arr is None:
+            raise ValueError(f"No [25, T] array found in {path}")
+
+        arr = arr.astype(np.float32)                              # [25, T]
+        arr = np.expand_dims(arr, axis=0)                         # [1, 25, T]  (channel axis)
+        data.append(arr)
+
+    x = np.concatenate(data, axis=0)                              # [N, 25, T]
+    x = np.expand_dims(x, axis=1)                                 # [N, 1, 25, T]
+    return torch.tensor(x, dtype=torch.float32)
+
+
+def label_to_tensor(labels: List[str]) -> torch.Tensor:
+    """
+    Map labels to integers:
+      'not_loneliness' -> 0
+      others (e.g., 'loneliness') -> 1
+    """
+    y = [0 if str(l).lower().strip() == 'not_loneliness' else 1 for l in labels]
+    return torch.tensor(y, dtype=torch.long)
+
+
+# ------------------------------- Model Definition ------------------------------ #
+class EEG_SELU_Model(nn.Module):
+    """
+    A compact CNN for EEG classification:
+    - Spatial conv across channels
+    - Temporal convs across time
+    - Global pooling + AlphaDropout + Linear
+    """
+    def __init__(
+        self,
+        spatial_kernel_h: int = 25,
+        spatial_kernel_w: int = 1,
+        kernel_1: int = 64,
+        kernel_2: int = 128,
+        stride: int = 2,
+        dropout: float = 0.3,
+        num_classes: int = 2
+    ):
+        super().__init__()
+        self.spatial_conv = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=(spatial_kernel_h, spatial_kernel_w), padding=(0, 0)),
+            nn.BatchNorm2d(16),
+            nn.SELU(inplace=True),
+        )
+        self.temporal_conv = nn.Sequential(
+            nn.Conv2d(16, 32, kernel_size=(1, kernel_1), stride=(1, stride), padding=(0, kernel_1 // 2)),
+            nn.BatchNorm2d(32),
+            nn.SELU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=(1, kernel_2), stride=(1, stride), padding=(0, kernel_2 // 2)),
+            nn.BatchNorm2d(64),
+            nn.SELU(inplace=True),
+        )
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.dropout = nn.AlphaDropout(dropout)
+        self.fc = nn.Linear(64, num_classes)
+
+        self.apply(le_cun_normal_init)  # initialize all Conv/Linear layers
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.spatial_conv(x)
+        x = self.temporal_conv(x)
+        x = self.pool(x)
+        x = self.dropout(x)
+        x = torch.flatten(x, 1)
+        return self.fc(x)
+
+
+def le_cun_normal_init(m: nn.Module) -> None:
+    """
+    Initialize Conv/Linear weights with LeCun normal (fan_in) which fits SELU.
+    Biases are set to zero.
+    """
+    if isinstance(m, (nn.Conv2d, nn.Linear)):
+        fan_in = None
+        if isinstance(m, nn.Conv2d):
+            # fan_in = in_channels * kH * kW
+            k_h, k_w = m.kernel_size if isinstance(m.kernel_size, tuple) else (m.kernel_size, m.kernel_size)
+            fan_in = m.in_channels * k_h * k_w
+        else:
+            fan_in = m.in_features
+        std = np.sqrt(1.0 / fan_in)
+        with torch.no_grad():
+            m.weight.normal_(0.0, std)
+            if m.bias is not None:
+                m.bias.zero_()
+
+
+# ------------------------------ Training Objective ----------------------------- #
+def run_one_fold(
+    fold_dict: Dict[str, Any],
+    params: Dict[str, Any],
+    device: torch.device
+) -> float:
+    """
+    Train/validate the model on a single fold and return the best validation accuracy.
+    """
+    x_train = load_mat_files_as_tensor(fold_dict['TrainFiles'])
+    y_train = label_to_tensor(fold_dict['TrainLabels'])
+    x_val   = load_mat_files_as_tensor(fold_dict['ValidationFiles'])
+    y_val   = label_to_tensor(fold_dict['ValidationLabels'])
+
+    train_loader = DataLoader(TensorDataset(x_train, y_train), batch_size=params['batch_size'], shuffle=True)
+    val_loader   = DataLoader(TensorDataset(x_val, y_val), batch_size=params['batch_size'], shuffle=False)
+
+    model = EEG_SELU_Model(
+        spatial_kernel_h=params['spatial_kernel_h'],
+        spatial_kernel_w=params['spatial_kernel_w'],
+        kernel_1=params['kernel_1'],
+        kernel_2=params['kernel_2'],
+        stride=params['stride'],
+        dropout=params['dropout'],
+        num_classes=2
+    ).to(device)
+
+    optimizer = optim.Adam(model.parameters(), lr=params['lr'], weight_decay=params['weight_decay'])
+    criterion = nn.CrossEntropyLoss()
+
+    best_acc = 0.0
+    patience = 4
+    no_improve = 0
+
+    for epoch in range(params['epochs']):
+        # ---- Train ---- #
+        model.train()
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            loss.backward()
+            optimizer.step()
+
+        # ---- Validate ---- #
+        model.eval()
+        preds_all, labels_all = [], []
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(device, non_blocking=True)
+                logits = model(xb)
+                preds = logits.argmax(dim=1).cpu().numpy().tolist()
+                preds_all.extend(preds)
+                labels_all.extend(yb.numpy().tolist())
+
+        acc = accuracy_score(labels_all, preds_all)
+        if acc > best_acc:
+            best_acc = acc
+            no_improve = 0
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                break
+
+    return best_acc
+
+
+def objective(trial: optuna.Trial, folds: List[Dict[str, Any]], device: torch.device) -> float:
+    # Hyperparameter search space
+    params = {
+        "lr": trial.suggest_float("lr", 1e-5, 5e-4, log=True),
+        "weight_decay": trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True),
+        "batch_size": trial.suggest_categorical("batch_size", [64, 128]),
+        "epochs": trial.suggest_int("epochs", 10, 25),
+        "kernel_1": trial.suggest_categorical("kernel_1", [64, 96, 128]),
+        "kernel_2": trial.suggest_categorical("kernel_2", [128, 256]),
+        "stride": trial.suggest_categorical("stride", [1, 2]),
+        "dropout": trial.suggest_float("dropout", 0.1, 0.4),
+        "spatial_kernel_h": trial.suggest_categorical("spatial_kernel_h", [15, 25]),
+        "spatial_kernel_w": trial.suggest_categorical("spatial_kernel_w", [1, 3]),
+    }
+
+    fold_accs = []
+    all_preds, all_labels = [], []
+
+    for i, fold in enumerate(folds):
+        best_acc = run_one_fold(fold, params, device)
+        fold_accs.append(best_acc)
+
+        # For lightweight reporting we only collect final predictions/labels per fold
+        # (to avoid heavy GPU/CPU use we skip storing all intermediate logits)
+        # If needed, extend here to store confusion matrices per epoch.
+        # Placeholder for compatibility:
+        # all_preds.extend(best_preds); all_labels.extend(best_labels)
+
+        logging.info(f"Fold {i+1}/{len(folds)} | best_val_acc={best_acc*100:.2f}%")
+
+    mean_acc = float(np.mean(fold_accs))
+    logging.info(
+        f"[Trial {trial.number}] mean_acc={mean_acc*100:.2f}% | params={params}"
+    )
+
+    # If you later aggregate predictions across folds, you can uncomment the metrics below:
+    # cm = confusion_matrix(all_labels, all_preds)
+    # f1_bin = f1_score(all_labels, all_preds, average='binary')
+    # f1_macro = f1_score(all_labels, all_preds, average='macro')
+    # logging.info(f"Confusion Matrix:\n{cm}\nF1(binary)={f1_bin:.4f} | F1(macro)={f1_macro:.4f}")
+
+    return mean_acc
+
+
+# ------------------------------------ Main ------------------------------------- #
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Optuna tuning for EEG SELU CNN.")
+    p.add_argument("--folddata", type=str, required=True, help="Path to FoldData.pkl")
+    p.add_argument("--trials", type=int, default=50, help="Number of Optuna trials")
+    p.add_argument("--seed", type=int, default=42, help="Random seed")
+    p.add_argument("--study-name", type=str, default="eeg_selu_optuna", help="Optuna study name")
+    p.add_argument("--storage", type=str, default=None,
+                   help="Optuna storage URL (e.g., sqlite:///eeg.db). If None, runs in-memory.")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    set_seeds(args.seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logging.info(f"Device: {device}")
+
+    # Load FoldData (universal, no personal paths)
+    with open(args.folddata, "rb") as f:
+        folds = pickle.load(f)
+
+    # Create study
+    sampler = TPESampler(seed=args.seed)
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=sampler,
+        study_name=args.study_name,
+        storage=args.storage,
+        load_if_exists=(args.storage is not None)
+    )
+
+    study.optimize(lambda t: objective(t, folds, device), n_trials=args.trials)
+
+    logging.info("Best hyperparameters:")
+    for k, v in study.best_params.items():
+        logging.info(f"  {k}: {v}")
+    logging.info(f"Best mean 4-fold accuracy: {study.best_value * 100:.2f}%")
+
+    out_path = "best_hyperparameters.pkl"
+    with open(out_path, "wb") as f:
+        pickle.dump(study.best_params, f)
+    logging.info(f"Saved best params to: {os.path.abspath(out_path)}")
+
+
+if __name__ == "__main__":
+    main()
