@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+env/
+.ipynb_checkpoints/
+
+# Data & artifacts
+data/**
+!data/.gitkeep
+outputs/**
+*.pkl
+
+# macOS
+.DS_Store
+
+# IDE / editor
+.vscode/
+.idea/
